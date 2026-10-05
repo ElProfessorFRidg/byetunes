@@ -42,7 +42,7 @@ enum PairingFileImportError: LocalizedError {
 }
 
 
-private let BUILD_VERSION = "v2.5"
+private let BUILD_VERSION = "v2.6"
 private let DEVICE_HOST = "10.7.0.1"
 private let RP_PAIRING_PORT: UInt16 = 49152
 

@@ -78,7 +78,7 @@ Inside your Xcode project and make sure you add:
 The `Build IPA` workflow (`.github/workflows/build-ipa.yml`) builds `idevice` from source, compiles the app and produces an **unsigned** `.ipa` on every push to `main`, every pull request, and on demand (Actions → Build IPA → Run workflow).
 
 - Every build of `main` publishes the raw `.ipa` to the rolling **`latest`** pre-release: [`ByeTunes.ipa`](../../releases/download/latest/ByeTunes.ipa).
-- Pushing a tag like `v2.5` publishes a versioned GitHub Release with the `.ipa` attached.
+- Pushing a tag like `v2.6` publishes a versioned GitHub Release with the `.ipa` attached.
 - Pull request builds attach the `.ipa` to the run as an artifact (GitHub zips run artifacts; Releases serve the plain `.ipa`).
 - Optional: set the `BYETUNES_API_URL` repository secret to bundle a `Config.plist` with your download server URL.
 
