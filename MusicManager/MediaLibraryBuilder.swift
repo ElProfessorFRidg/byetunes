@@ -1316,23 +1316,6 @@ class MediaLibraryBuilder {
             Logger.shared.log("[MediaLibraryBuilder] Sort reorder skipped for merge path")
         }
         
-        Logger.shared.log("[MediaLibraryBuilder] Fixing existing records without sync_id...")
-        
-        
-        try executeSQL(db, """
-            UPDATE album SET sync_id = abs(random()), keep_local = 1 WHERE sync_id = 0
-        """)
-        
-        
-        try executeSQL(db, """
-            UPDATE album_artist SET sync_id = abs(random()), keep_local = 1 WHERE sync_id = 0
-        """)
-        
-        
-        try executeSQL(db, """
-            UPDATE item_artist SET sync_id = abs(random()), keep_local = 1 WHERE sync_id = 0
-        """)
-        
         Logger.shared.log("[MediaLibraryBuilder] Merged \(songs.count) new songs, \(collectedArtworkInfo.count) with artwork")
         return (insertedPids, collectedArtworkInfo)
     }
