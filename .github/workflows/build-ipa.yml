@@ -146,21 +146,43 @@ jobs:
           path: ${{ runner.temp }}/xcodebuild.log
           if-no-files-found: ignore
 
+  # Release assets are served as-is (run artifacts are always zipped by GitHub),
+  # so every build of main and every v* tag publishes the raw .ipa to a Release.
   release:
-    name: Publish GitHub Release
-    if: startsWith(github.ref, 'refs/tags/v')
+    name: Publish .ipa to GitHub Release
+    if: github.event_name != 'pull_request' && (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v'))
     needs: build
     runs-on: ubuntu-latest
     permissions:
       contents: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+      IPA: ${{ needs.build.outputs.ipa-name }}
     steps:
       - name: Download IPA
         uses: actions/download-artifact@v4
         with:
           name: ${{ needs.build.outputs.ipa-name }}
 
-      - name: Create release
-        uses: softprops/action-gh-release@v2
-        with:
-          files: ${{ needs.build.outputs.ipa-name }}
-          generate_release_notes: true
+      - name: Publish rolling "latest" release (main)
+        if: github.ref == 'refs/heads/main'
+        run: |
+          set -euo pipefail
+          cp "$IPA" ByeTunes.ipa
+          gh release delete latest --cleanup-tag --yes || true
+          gh release create latest ByeTunes.ipa "$IPA" \
+            --target "$GITHUB_SHA" \
+            --prerelease \
+            --title "Latest build (${GITHUB_SHA::7})" \
+            --notes "Unsigned build of \`main\` at ${GITHUB_SHA}. Sign it when sideloading (AltStore, SideStore, Sideloadly, ...)."
+
+      - name: Publish versioned release (tag)
+        if: startsWith(github.ref, 'refs/tags/v')
+        run: |
+          set -euo pipefail
+          if gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
+            gh release upload "$GITHUB_REF_NAME" "$IPA" --clobber
+          else
+            gh release create "$GITHUB_REF_NAME" "$IPA" --verify-tag --generate-notes
+          fi
