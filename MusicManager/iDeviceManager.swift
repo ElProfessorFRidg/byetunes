@@ -1598,6 +1598,70 @@ class DeviceManager: ObservableObject {
         }
     }
 
+    func syncFavoriteSongsPlaylist(progress: @escaping (String) -> Void, completion: @escaping (Bool, String) -> Void) {
+        let operationToken = beginRepairOperation()
+        DispatchQueue.global(qos: .userInitiated).async {
+            guard self.ensureActiveTransport(reason: "syncing Favorite Songs") else {
+                completion(false, "Device connection unavailable.")
+                return
+            }
+
+            progress("Preparing Favorite Songs sync...")
+            let killed = self.terminateMusicAppIfRunning()
+            Logger.shared.log("[SyncLifecycle] Music pre-kill for Favorite Songs sync \(killed ? "completed" : "skipped/failed")")
+
+            guard let context = self.stageCurrentMediaLibraryForMutation(label: "favorite_songs_sync") else {
+                completion(false, "Could not stage MediaLibrary.sqlitedb.")
+                return
+            }
+            defer { try? FileManager.default.removeItem(at: context.tempDir) }
+
+            if self.isRepairOperationCancelled(operationToken) {
+                completion(false, "Sync cancelled.")
+                return
+            }
+
+            progress("Adding favorited songs to Favorite Songs...")
+            var db: OpaquePointer?
+            guard sqlite3_open(context.dbURL.path, &db) == SQLITE_OK else {
+                if db != nil { sqlite3_close(db) }
+                completion(false, "Could not open MediaLibrary.sqlitedb.")
+                return
+            }
+
+            let result: MediaLibraryBuilder.FavoriteSongsSyncResult
+            do {
+                result = try MediaLibraryBuilder.syncLocalFavoritesToFavoriteSongsPlaylist(db: db)
+                _ = self.sqliteExec(db, "PRAGMA wal_checkpoint(TRUNCATE)")
+                _ = self.sqliteExec(db, "PRAGMA journal_mode=DELETE")
+                sqlite3_close(db)
+            } catch {
+                sqlite3_close(db)
+                Logger.shared.log("[DeviceManager] Favorite Songs sync failed: \(error)")
+                completion(false, "Could not update Favorite Songs.")
+                return
+            }
+
+            guard result.playlistFound else {
+                completion(false, "No Favorite Songs playlist on this device yet. Favorite any Apple Music song once so iOS creates it.")
+                return
+            }
+            guard result.added > 0 || result.removed > 0 else {
+                completion(true, "Favorite Songs already up to date.")
+                return
+            }
+
+            progress("Uploading updated library...")
+            guard self.commitStagedMediaLibrary(localDbURL: context.dbURL) else {
+                completion(false, "Failed to upload the updated library.")
+                return
+            }
+
+            self.sendSyncFinishedNotification()
+            completion(true, "Favorite Songs updated: \(result.added) added, \(result.removed) removed.")
+        }
+    }
+
     private func repairAlphabeticalOrderingInLocalDatabase(_ dbURL: URL, logContext: String) -> Bool {
         var db: OpaquePointer?
         guard sqlite3_open(dbURL.path, &db) == SQLITE_OK else {
