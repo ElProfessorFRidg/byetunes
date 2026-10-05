@@ -73,6 +73,16 @@ Inside your Xcode project and make sure you add:
 
 **In Project Settings > Build Phases > Link Binary With Libraries, make sure libidevice_ffi.a is listed.**
 
+### Automated Builds (GitHub Actions)
+
+The `Build IPA` workflow (`.github/workflows/build-ipa.yml`) builds `idevice` from source, compiles the app and produces an **unsigned** `.ipa` on every push to `main`, every pull request, and on demand (Actions → Build IPA → Run workflow).
+
+- The `.ipa` is attached to each run as an artifact.
+- Pushing a tag like `v2.5` also publishes a GitHub Release with the `.ipa` attached.
+- Optional: set the `BYETUNES_API_URL` repository secret to bundle a `Config.plist` with your download server URL.
+
+The `.ipa` is unsigned: sign it when sideloading (AltStore, SideStore, Sideloadly, …).
+
 ## How to Use
 
 1. **LocalDevVPN**:

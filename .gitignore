@@ -29,3 +29,8 @@ MusicManager/Bridging-Header.h
 
 # Local Secrets / Configurations
 MusicManager/Config.plist
+
+# CI build outputs
+.idevice-out/
+Payload/
+*.ipa

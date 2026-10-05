@@ -1,0 +1,166 @@
+name: Build IPA
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+  workflow_dispatch:
+    inputs:
+      configuration:
+        description: Xcode build configuration
+        type: choice
+        options: [Release, Debug]
+        default: Release
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  # idevice release whose FFI matches the calls made in iDeviceManager.swift.
+  IDEVICE_REF: v0.1.68
+  IDEVICE_FEATURES: obfuscate
+  # Must match IPHONEOS_DEPLOYMENT_TARGET of the MusicManager target.
+  IOS_DEPLOYMENT_TARGET: '16.0'
+  CONFIGURATION: ${{ inputs.configuration || 'Release' }}
+
+jobs:
+  build:
+    name: Build unsigned IPA
+    runs-on: macos-26
+    timeout-minutes: 60
+    outputs:
+      ipa-name: ${{ steps.package.outputs.ipa-name }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Select Xcode
+        uses: maxim-lobanov/setup-xcode@v1
+        with:
+          xcode-version: latest-stable
+
+      # ---- idevice FFI (libidevice_ffi.a + idevice.h) ----
+
+      - name: Restore idevice FFI cache
+        id: idevice-cache
+        uses: actions/cache@v4
+        with:
+          path: .idevice-out
+          key: idevice-ffi-${{ env.IDEVICE_REF }}-${{ env.IDEVICE_FEATURES }}-ios${{ env.IOS_DEPLOYMENT_TARGET }}-${{ runner.os }}-${{ runner.arch }}
+
+      - name: Install Rust
+        if: steps.idevice-cache.outputs.cache-hit != 'true'
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-ios
+
+      - name: Build idevice FFI
+        if: steps.idevice-cache.outputs.cache-hit != 'true'
+        run: |
+          set -euo pipefail
+          git clone --depth 1 --branch "$IDEVICE_REF" https://github.com/jkcoxson/idevice "$RUNNER_TEMP/idevice"
+          cd "$RUNNER_TEMP/idevice/ffi"
+          export IPHONEOS_DEPLOYMENT_TARGET="$IOS_DEPLOYMENT_TARGET"
+          export RUSTFLAGS="-C link-arg=-miphoneos-version-min=$IOS_DEPLOYMENT_TARGET"
+          export BINDGEN_EXTRA_CLANG_ARGS="--sysroot=$(xcrun --sdk iphoneos --show-sdk-path)"
+          cargo build --release --target aarch64-apple-ios --features "$IDEVICE_FEATURES"
+          mkdir -p "$GITHUB_WORKSPACE/.idevice-out"
+          cp idevice.h "$GITHUB_WORKSPACE/.idevice-out/idevice.h"
+          cp ../target/aarch64-apple-ios/release/libidevice_ffi.a "$GITHUB_WORKSPACE/.idevice-out/libidevice_ffi.a"
+
+      - name: Install idevice FFI into the project
+        run: |
+          set -euo pipefail
+          cp .idevice-out/idevice.h MusicManager/idevice.h
+          cp .idevice-out/libidevice_ffi.a MusicManager/libidevice_ffi.a
+          printf '#import "idevice.h"\n' > MusicManager/Bridging-Header.h
+          ls -la MusicManager/idevice.h MusicManager/libidevice_ffi.a MusicManager/Bridging-Header.h
+
+      # Optional: the download backend URL is read from a bundled Config.plist.
+      # Without the secret the app falls back to its built-in default.
+      - name: Write Config.plist
+        env:
+          BYETUNES_API_URL: ${{ secrets.BYETUNES_API_URL }}
+        run: |
+          set -euo pipefail
+          if [ -n "${BYETUNES_API_URL:-}" ]; then
+            plutil -create xml1 MusicManager/Config.plist
+            plutil -insert ByeTunesApiUrl -string "$BYETUNES_API_URL" MusicManager/Config.plist
+            echo "Config.plist written."
+          else
+            echo "BYETUNES_API_URL secret not set; building without Config.plist."
+          fi
+
+      # ---- App ----
+
+      - name: Build app
+        run: |
+          set -euo pipefail
+          xcodebuild -version
+          xcodebuild \
+            -project MusicManager.xcodeproj \
+            -target MusicManager \
+            -configuration "$CONFIGURATION" \
+            -sdk iphoneos \
+            ARCHS=arm64 \
+            SYMROOT="$PWD/build" \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGN_IDENTITY="" \
+            -quiet \
+            build 2>&1 | tee "$RUNNER_TEMP/xcodebuild.log"
+
+      - name: Package IPA
+        id: package
+        run: |
+          set -euo pipefail
+          APP="build/$CONFIGURATION-iphoneos/ByeTunes.app"
+          test -d "$APP"
+          VERSION=$(/usr/libexec/PlistBuddy -c "Print :CFBundleShortVersionString" "$APP/Info.plist")
+          BUILD=$(/usr/libexec/PlistBuddy -c "Print :CFBundleVersion" "$APP/Info.plist")
+          if [[ "$GITHUB_REF" == refs/tags/* ]]; then
+            NAME="ByeTunes-${GITHUB_REF_NAME}.ipa"
+          else
+            NAME="ByeTunes-${VERSION}-${GITHUB_SHA::7}.ipa"
+          fi
+          rm -rf Payload && mkdir Payload
+          cp -R "$APP" Payload/
+          zip -qry "$NAME" Payload
+          echo "Built $NAME (version $VERSION, build $BUILD), $(du -h "$NAME" | cut -f1)"
+          echo "ipa-name=$NAME" >> "$GITHUB_OUTPUT"
+
+      - name: Upload IPA
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.package.outputs.ipa-name }}
+          path: ${{ steps.package.outputs.ipa-name }}
+          if-no-files-found: error
+
+      - name: Upload build log
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: xcodebuild-log
+          path: ${{ runner.temp }}/xcodebuild.log
+          if-no-files-found: ignore
+
+  release:
+    name: Publish GitHub Release
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Download IPA
+        uses: actions/download-artifact@v4
+        with:
+          name: ${{ needs.build.outputs.ipa-name }}
+
+      - name: Create release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: ${{ needs.build.outputs.ipa-name }}
+          generate_release_notes: true
