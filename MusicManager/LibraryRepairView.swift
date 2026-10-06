@@ -7,6 +7,7 @@ struct LibraryRepairView: View {
 
     @State private var isFixingArtwork = false
     @State private var isFixingAlphabeticalOrder = false
+    @State private var isSyncingFavorites = false
     @State private var isRebuildingAlbumArtwork = false
     @State private var isRunningRepairDoctor = false
     @State private var artworkFixMessage = "Fixing artwork..."
@@ -155,6 +156,59 @@ struct LibraryRepairView: View {
                         .padding(.horizontal, 16)
                         .opacity((isFixingAlphabeticalOrder || !manager.heartbeatReady) ? 0.55 : 1)
 
+                        Divider().padding(.leading, 56)
+
+                        HStack {
+                            Button {
+                                syncFavoriteSongs()
+                            } label: {
+                                HStack {
+                                    if isSyncingFavorites {
+                                        ProgressView()
+                                            .frame(width: 28)
+                                    } else {
+                                        Image(systemName: "star")
+                                            .font(.body)
+                                            .foregroundColor(.primary)
+                                            .frame(width: 28)
+                                    }
+
+                                    VStack(alignment: .leading, spacing: 2) {
+                                        Text(isSyncingFavorites ? "Syncing Favorite Songs..." : "Sync Favorite Songs")
+                                            .font(.body)
+                                            .foregroundColor(.primary)
+                                        Text("Add favorited imported songs to Favorite Songs.")
+                                            .font(.caption)
+                                            .foregroundColor(.secondary)
+                                            .multilineTextAlignment(.leading)
+                                    }
+                                }
+                            }
+                            .buttonStyle(.plain)
+                            .disabled(isSyncingFavorites || !manager.heartbeatReady)
+
+                            Spacer()
+
+                            Button {
+                                showInfo(
+                                    "Sync Favorite Songs",
+                                    "Songs imported with ByeTunes only exist on this device, so iCloud never adds them to the Favorite Songs playlist. This adds the imported songs you favorited to Favorite Songs on this device (and removes ones you unfavorited). It also runs automatically on every import. An iCloud library sync may remove them again; run it again if that happens."
+                                )
+                            } label: {
+                                infoButton
+                            }
+                            .buttonStyle(.plain)
+
+                            if !isSyncingFavorites {
+                                Image(systemName: "chevron.right")
+                                    .font(.caption)
+                                    .foregroundColor(Color(.systemGray3))
+                            }
+                        }
+                        .padding(.vertical, 14)
+                        .padding(.horizontal, 16)
+                        .opacity((isSyncingFavorites || !manager.heartbeatReady) ? 0.55 : 1)
+
                         if manager.supportsIOS26ArtworkRepair {
                             Divider().padding(.leading, 56)
 
@@ -296,7 +350,7 @@ struct LibraryRepairView: View {
                 .zIndex(100)
             }
 
-            if isFixingArtwork || isRebuildingAlbumArtwork || isRunningRepairDoctor || isFixingAlphabeticalOrder {
+            if isFixingArtwork || isRebuildingAlbumArtwork || isRunningRepairDoctor || isFixingAlphabeticalOrder || isSyncingFavorites {
                 artworkFixPopup
                     .transition(.opacity.combined(with: .scale(scale: 0.97)))
             }
@@ -304,6 +358,7 @@ struct LibraryRepairView: View {
         .animation(.spring(response: 0.3, dampingFraction: 0.85), value: isFixingArtwork)
         .animation(.spring(response: 0.3, dampingFraction: 0.85), value: isRebuildingAlbumArtwork)
         .animation(.spring(response: 0.3, dampingFraction: 0.85), value: isFixingAlphabeticalOrder)
+        .animation(.spring(response: 0.3, dampingFraction: 0.85), value: isSyncingFavorites)
         .navigationTitle("Library Repair")
         .navigationBarTitleDisplayMode(.inline)
         .alert(infoAlertTitle, isPresented: $showingInfoAlert) {
@@ -324,13 +379,13 @@ struct LibraryRepairView: View {
                         .fill(Color.accentColor.opacity(0.12))
                         .frame(width: 58, height: 58)
 
-                    Image(systemName: isRunningRepairDoctor ? "heart.text.square" : (isFixingAlphabeticalOrder ? "textformat.abc.dottedunderline" : (isExperimentalArtworkRefreshActive ? "wand.and.stars" : "photo.on.rectangle.angled")))
+                    Image(systemName: isRunningRepairDoctor ? "heart.text.square" : (isFixingAlphabeticalOrder ? "textformat.abc.dottedunderline" : (isSyncingFavorites ? "star.fill" : (isExperimentalArtworkRefreshActive ? "wand.and.stars" : "photo.on.rectangle.angled"))))
                         .font(.system(size: 25, weight: .semibold))
                         .foregroundColor(.accentColor)
                 }
 
                 VStack(spacing: 6) {
-                    Text(isRunningRepairDoctor ? "Clean & Repair Library" : (isFixingAlphabeticalOrder ? "Fix Alphabetical Order" : (isExperimentalArtworkRefreshActive ? "Refreshing Metadata & Artwork" : "Fixing Artwork")))
+                    Text(isRunningRepairDoctor ? "Clean & Repair Library" : (isFixingAlphabeticalOrder ? "Fix Alphabetical Order" : (isSyncingFavorites ? "Sync Favorite Songs" : (isExperimentalArtworkRefreshActive ? "Refreshing Metadata & Artwork" : "Fixing Artwork"))))
                         .font(.headline)
                         .foregroundColor(.primary)
 
@@ -461,6 +516,26 @@ struct LibraryRepairView: View {
                 self.showToastMessage(
                     title: success ? message : "Alphabetical Fix Failed: \(message)",
                     icon: success ? "textformat.abc.dottedunderline" : "exclamationmark.triangle.fill"
+                )
+            }
+        }
+    }
+
+    private func syncFavoriteSongs() {
+        isSyncingFavorites = true
+        updateArtworkFixProgress("Preparing Favorite Songs sync...")
+
+        manager.syncFavoriteSongsPlaylist { message in
+            DispatchQueue.main.async {
+                self.updateArtworkFixProgress(message)
+            }
+        } completion: { success, message in
+            DispatchQueue.main.async {
+                self.isSyncingFavorites = false
+                guard !message.lowercased().contains("cancel") else { return }
+                self.showToastMessage(
+                    title: success ? message : "Favorite Sync Failed: \(message)",
+                    icon: success ? "star.fill" : "exclamationmark.triangle.fill"
                 )
             }
         }

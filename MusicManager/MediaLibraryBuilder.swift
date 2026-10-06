@@ -356,8 +356,12 @@ class MediaLibraryBuilder {
         } else if let playlistName = playlistName, !playlistName.isEmpty {
             try createPlaylist(db: db, playlistName: playlistName, songPids: songPids)
         }
-        
-        
+
+        do {
+            try syncLocalFavoritesToFavoriteSongsPlaylist(db: db)
+        } catch {
+            Logger.shared.log("[MediaLibraryBuilder] Favorite Songs sync warning: \(error)")
+        }
         
         var errorMsg: UnsafeMutablePointer<CChar>?
         sqlite3_exec(db, "PRAGMA wal_checkpoint(TRUNCATE)", nil, nil, &errorMsg)
@@ -788,7 +792,6 @@ class MediaLibraryBuilder {
             try? executeSQL(db, "DELETE FROM item WHERE item_pid = \(itemPid)")
             try? executeSQL(db, "DELETE FROM item_extra WHERE item_pid = \(itemPid)")
             try? executeSQL(db, "DELETE FROM item_playback WHERE item_pid = \(itemPid)")
-            try? executeSQL(db, "DELETE FROM item_stats WHERE item_pid = \(itemPid)")
             try? executeSQL(db, "DELETE FROM item_store WHERE item_pid = \(itemPid)")
             try? executeSQL(db, "DELETE FROM item_search WHERE item_pid = \(itemPid)")
             
@@ -856,7 +859,7 @@ class MediaLibraryBuilder {
             """)
             
             
-            try executeSQL(db, "INSERT OR REPLACE INTO item_stats (item_pid, date_accessed) VALUES (\(itemPid), \(now))")
+            try executeSQL(db, "INSERT OR IGNORE INTO item_stats (item_pid, date_accessed) VALUES (\(itemPid), \(now))")
             
             
             
@@ -1927,6 +1930,143 @@ class MediaLibraryBuilder {
         Logger.shared.log("[MediaLibraryBuilder] Reordered \(orderedItemPids.count) songs in playlist \(containerPid)")
     }
     
+    // MARK: - Favorite Songs
+    struct FavoriteSongsSyncResult {
+        let playlistFound: Bool
+        let added: Int
+        let removed: Int
+    }
+
+    private static let favoriteSongsPlaylistNames: Set<String> = [
+        "favorite songs", "favourite songs", "morceaux favoris", "lieblingssongs",
+        "canciones favoritas", "brani preferiti", "musicas favoritas", "favoriete nummers"
+    ]
+
+    private static func normalizedPlaylistName(_ name: String) -> String {
+        name.folding(options: [.caseInsensitive, .diacriticInsensitive], locale: nil)
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    private static func favoriteSongsContainerPid(db: OpaquePointer?) -> Int64? {
+        var candidates: [Int64] = []
+        var stmt: OpaquePointer?
+        if sqlite3_prepare_v2(db, "SELECT container_pid, name FROM container", -1, &stmt, nil) == SQLITE_OK {
+            while sqlite3_step(stmt) == SQLITE_ROW {
+                guard let namePtr = sqlite3_column_text(stmt, 1) else { continue }
+                if favoriteSongsPlaylistNames.contains(normalizedPlaylistName(String(cString: namePtr))) {
+                    candidates.append(sqlite3_column_int64(stmt, 0))
+                }
+            }
+        }
+        sqlite3_finalize(stmt)
+
+        guard candidates.count > 1 else { return candidates.first }
+
+        var best: (pid: Int64, likedCount: Int64)?
+        let countSQL = """
+            SELECT COUNT(*) FROM container_item ci
+            JOIN item_stats s ON s.item_pid = ci.item_pid
+            WHERE ci.container_pid = ? AND s.liked_state != 0
+        """
+        for pid in candidates {
+            var countStmt: OpaquePointer?
+            var count: Int64 = 0
+            if sqlite3_prepare_v2(db, countSQL, -1, &countStmt, nil) == SQLITE_OK {
+                sqlite3_bind_int64(countStmt, 1, pid)
+                if sqlite3_step(countStmt) == SQLITE_ROW {
+                    count = sqlite3_column_int64(countStmt, 0)
+                }
+            }
+            sqlite3_finalize(countStmt)
+            if best == nil || count > best!.likedCount {
+                best = (pid, count)
+            }
+        }
+        return best?.pid
+    }
+
+    private static func favoriteLikedStateValue(db: OpaquePointer?, containerPid: Int64) -> Int64 {
+        let sql = """
+            SELECT s.liked_state FROM container_item ci
+            JOIN item_stats s ON s.item_pid = ci.item_pid
+            WHERE ci.container_pid = ? AND s.liked_state != 0
+            GROUP BY s.liked_state ORDER BY COUNT(*) DESC LIMIT 1
+        """
+        var stmt: OpaquePointer?
+        var value: Int64 = 2
+        if sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK {
+            sqlite3_bind_int64(stmt, 1, containerPid)
+            if sqlite3_step(stmt) == SQLITE_ROW {
+                value = sqlite3_column_int64(stmt, 0)
+            }
+        }
+        sqlite3_finalize(stmt)
+        return value
+    }
+
+    @discardableResult
+    static func syncLocalFavoritesToFavoriteSongsPlaylist(db: OpaquePointer?) throws -> FavoriteSongsSyncResult {
+        guard columnExists(db: db, tableName: "item_stats", columnName: "liked_state") else {
+            Logger.shared.log("[MediaLibraryBuilder] Favorite sync skipped: item_stats.liked_state missing")
+            return FavoriteSongsSyncResult(playlistFound: false, added: 0, removed: 0)
+        }
+        guard let containerPid = favoriteSongsContainerPid(db: db) else {
+            Logger.shared.log("[MediaLibraryBuilder] Favorite sync skipped: no Favorite Songs playlist on device")
+            return FavoriteSongsSyncResult(playlistFound: false, added: 0, removed: 0)
+        }
+
+        let likedValue = favoriteLikedStateValue(db: db, containerPid: containerPid)
+
+        let removeSQL = """
+            DELETE FROM container_item
+            WHERE container_pid = ? AND item_pid IN (
+                SELECT i.item_pid FROM item i
+                LEFT JOIN item_stats s ON s.item_pid = i.item_pid
+                WHERE i.base_location_id = 3840 AND IFNULL(s.liked_state, 0) != ?
+            )
+        """
+        var stmt: OpaquePointer?
+        var removed = 0
+        if sqlite3_prepare_v2(db, removeSQL, -1, &stmt, nil) == SQLITE_OK {
+            sqlite3_bind_int64(stmt, 1, containerPid)
+            sqlite3_bind_int64(stmt, 2, likedValue)
+            if sqlite3_step(stmt) != SQLITE_DONE {
+                let error = String(cString: sqlite3_errmsg(db))
+                sqlite3_finalize(stmt)
+                throw MediaLibraryError.insertFailed("favorite sync remove: \(error)")
+            }
+            removed = Int(sqlite3_changes(db))
+        }
+        sqlite3_finalize(stmt)
+
+        let missingSQL = """
+            SELECT i.item_pid FROM item i
+            JOIN item_stats s ON s.item_pid = i.item_pid
+            WHERE i.base_location_id = 3840 AND i.media_type = 8 AND s.liked_state = ?
+              AND i.item_pid NOT IN (SELECT item_pid FROM container_item WHERE container_pid = ?)
+            ORDER BY s.liked_state_changed_date ASC, i.item_pid ASC
+        """
+        var missingPids: [Int64] = []
+        if sqlite3_prepare_v2(db, missingSQL, -1, &stmt, nil) == SQLITE_OK {
+            sqlite3_bind_int64(stmt, 1, likedValue)
+            sqlite3_bind_int64(stmt, 2, containerPid)
+            while sqlite3_step(stmt) == SQLITE_ROW {
+                missingPids.append(sqlite3_column_int64(stmt, 0))
+            }
+        }
+        sqlite3_finalize(stmt)
+
+        if !missingPids.isEmpty {
+            try addToPlaylist(db: db, containerPid: containerPid, songPids: missingPids)
+        }
+        if removed > 0 || !missingPids.isEmpty {
+            try executeSQL(db, "UPDATE container SET date_modified = \(Int64(Date().timeIntervalSince1970)) WHERE container_pid = \(containerPid)")
+        }
+
+        Logger.shared.log("[MediaLibraryBuilder] Favorite Songs sync (pid \(containerPid), liked_state=\(likedValue)): added \(missingPids.count), removed \(removed)")
+        return FavoriteSongsSyncResult(playlistFound: true, added: missingPids.count, removed: removed)
+    }
+
     static func addRingtonesToExistingDatabase(
         existingDbData: Data,
         walData: Data? = nil,
