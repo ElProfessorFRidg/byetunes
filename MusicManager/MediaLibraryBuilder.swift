@@ -1938,13 +1938,36 @@ class MediaLibraryBuilder {
     }
 
     private static let favoriteSongsPlaylistNames: Set<String> = [
-        "favorite songs", "favourite songs", "morceaux favoris", "lieblingssongs",
+        "favorite songs", "favourite songs",
+        "morceaux preferes", "morceaux favoris", "titres favoris", "chansons preferees",
+        "lieblingssongs", "lieblingstitel",
         "canciones favoritas", "brani preferiti", "musicas favoritas", "favoriete nummers"
     ]
 
     private static func normalizedPlaylistName(_ name: String) -> String {
-        name.folding(options: [.caseInsensitive, .diacriticInsensitive], locale: nil)
-            .trimmingCharacters(in: .whitespacesAndNewlines)
+        let folded = name.folding(options: [.caseInsensitive, .diacriticInsensitive], locale: nil)
+        let lettersOnly = String(folded.unicodeScalars.map {
+            CharacterSet.alphanumerics.contains($0) ? Character($0) : " "
+        })
+        return lettersOnly.split(separator: " ").joined(separator: " ")
+    }
+
+    private static func likedCount(db: OpaquePointer?, containerPid: Int64) -> Int64 {
+        let sql = """
+            SELECT COUNT(*) FROM container_item ci
+            JOIN item_stats s ON s.item_pid = ci.item_pid
+            WHERE ci.container_pid = ? AND s.liked_state != 0
+        """
+        var stmt: OpaquePointer?
+        var count: Int64 = 0
+        if sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK {
+            sqlite3_bind_int64(stmt, 1, containerPid)
+            if sqlite3_step(stmt) == SQLITE_ROW {
+                count = sqlite3_column_int64(stmt, 0)
+            }
+        }
+        sqlite3_finalize(stmt)
+        return count
     }
 
     private static func favoriteSongsContainerPid(db: OpaquePointer?) -> Int64? {
@@ -1960,29 +1983,44 @@ class MediaLibraryBuilder {
         }
         sqlite3_finalize(stmt)
 
-        guard candidates.count > 1 else { return candidates.first }
+        if candidates.count == 1 { return candidates.first }
+        if candidates.count > 1 {
+            return candidates.max { likedCount(db: db, containerPid: $0) < likedCount(db: db, containerPid: $1) }
+        }
 
-        var best: (pid: Int64, likedCount: Int64)?
-        let countSQL = """
-            SELECT COUNT(*) FROM container_item ci
-            JOIN item_stats s ON s.item_pid = ci.item_pid
-            WHERE ci.container_pid = ? AND s.liked_state != 0
+        let structuralSQL = """
+            SELECT ci.container_pid, c.name,
+                   COUNT(*) AS total,
+                   SUM(CASE WHEN IFNULL(s.liked_state, 0) != 0 THEN 1 ELSE 0 END) AS liked
+            FROM container_item ci
+            JOIN container c ON c.container_pid = ci.container_pid
+            LEFT JOIN item_stats s ON s.item_pid = ci.item_pid
+            GROUP BY ci.container_pid
+            HAVING total >= 3 AND liked * 10 >= total * 9
+            ORDER BY liked DESC
+            LIMIT 1
         """
-        for pid in candidates {
-            var countStmt: OpaquePointer?
-            var count: Int64 = 0
-            if sqlite3_prepare_v2(db, countSQL, -1, &countStmt, nil) == SQLITE_OK {
-                sqlite3_bind_int64(countStmt, 1, pid)
-                if sqlite3_step(countStmt) == SQLITE_ROW {
-                    count = sqlite3_column_int64(countStmt, 0)
-                }
-            }
-            sqlite3_finalize(countStmt)
-            if best == nil || count > best!.likedCount {
-                best = (pid, count)
+        var structuralPid: Int64?
+        if sqlite3_prepare_v2(db, structuralSQL, -1, &stmt, nil) == SQLITE_OK {
+            if sqlite3_step(stmt) == SQLITE_ROW {
+                structuralPid = sqlite3_column_int64(stmt, 0)
+                let name = sqlite3_column_text(stmt, 1).map { String(cString: $0) } ?? ""
+                Logger.shared.log("[MediaLibraryBuilder] Favorite Songs matched by content: '\(name)' (pid \(structuralPid!), liked \(sqlite3_column_int64(stmt, 3))/\(sqlite3_column_int64(stmt, 2)))")
             }
         }
-        return best?.pid
+        sqlite3_finalize(stmt)
+
+        if structuralPid == nil {
+            var names: [String] = []
+            if sqlite3_prepare_v2(db, "SELECT name FROM container WHERE name != ''", -1, &stmt, nil) == SQLITE_OK {
+                while sqlite3_step(stmt) == SQLITE_ROW {
+                    if let namePtr = sqlite3_column_text(stmt, 0) { names.append(String(cString: namePtr)) }
+                }
+            }
+            sqlite3_finalize(stmt)
+            Logger.shared.log("[MediaLibraryBuilder] Favorite Songs not found among playlists: \(names)")
+        }
+        return structuralPid
     }
 
     private static func favoriteLikedStateValue(db: OpaquePointer?, containerPid: Int64) -> Int64 {
